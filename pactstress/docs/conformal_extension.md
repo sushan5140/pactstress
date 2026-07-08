@@ -23,6 +23,12 @@ the output. This extension addresses that directly: instead of asking
 and back that third option with a real statistical guarantee rather than an
 ad hoc confidence heuristic.
 
+Validated on real WESAD data (see "Validated results" below), this
+mechanism does successfully catch the model's worst population-level
+failure case, and partially catches S2 — but combining it naively with
+PACT's own calibration turns out to weaken rather than strengthen this
+effect. That tension is itself one of this extension's findings.
+
 ## Method: split conformal prediction
 
 We use split conformal prediction (Vovk et al., 2005), a distribution-free
@@ -53,23 +59,89 @@ time — regardless of whether the underlying classifier is any good. What
 conformal prediction adds is not better accuracy, but an honest signal of
 *when the model doesn't know*.
 
-## What to expect from this extension
+## Validated results on WESAD
 
-Applying this to the same WESAD features and Random Forest classifier used
-in PACT, the outcome we're specifically checking for is whether S2's
-windows shift from confident-and-wrong toward abstain (`{0, 1}`) — i.e.,
-whether the model's uncertainty machinery actually recognizes S2 as a hard
-case, rather than continuing to confidently misclassify.
+We ran `evaluate_loso_conformal` (α = 0.1, targeting 90% coverage) in two
+configurations: directly on raw population-level features, and on top of
+PACT-calibrated features. The results reveal a real tension between the two
+techniques, not a clean win from stacking them.
 
-Run `evaluate_loso_conformal` (see `examples/`) to reproduce this on real
-WESAD data. Report, per subject:
-- **coverage** — should track the target (1-α) on average across subjects
-- **abstain_rate** — expected to be higher for atypical subjects (S2, and
-  possibly S8/S15, which showed calibration instability in the original
-  PACT results) than for well-behaved subjects
-- **singleton_accuracy** — accuracy restricted to confident predictions
-  only; this should be noticeably higher than PACT's raw per-subject
-  accuracy, since it excludes the cases the model flags as uncertain
+### Configuration 1: Conformal prediction on raw (uncalibrated) features
+
+| Metric | Value |
+|---|---|
+| Mean coverage | 0.899 (target: 0.90) |
+| Mean abstain rate | 0.153 |
+| Mean singleton accuracy | 0.930 |
+
+Coverage lands almost exactly on target, confirming the conformal guarantee
+holds on real physiological data, not just synthetic test cases. Singleton
+accuracy (0.930) is meaningfully higher than PACT's raw population-level
+accuracy (0.875) — excluding the ~15% of windows the model flags as
+uncertain, its confident predictions are noticeably more trustworthy.
+
+Critically, **S10 — the worst-performing subject in the original
+population-level model (42.9% accuracy, confidently wrong on most
+windows) — abstains on 100% of its windows** under conformal prediction,
+rather than being confidently misclassified. This is the core behavior this
+extension was built to produce. **S2 is partially caught**: an 11.9%
+abstain rate (the 6th-highest of 15 subjects) and the lowest singleton
+accuracy in the dataset (0.673) — the model doesn't abstain on S2 nearly as
+often as on S10, but it is noticeably less confident and less accurate on
+S2 even when it does commit to an answer.
+
+### Configuration 2: Conformal prediction on top of PACT-calibrated features
+
+| Metric | Value |
+|---|---|
+| Mean coverage | 0.865 (target: 0.90) |
+| Mean abstain rate | 0.136 |
+| Mean singleton accuracy | 0.926 |
+
+This is the more complete version of the intended pipeline (PACT, then
+conformal on top), and it does not simply improve on Configuration 1.
+Coverage drops meaningfully below the 0.90 target — a real shortfall, not
+noise. More strikingly, **S2's abstain rate drops to 0%**: the conformal
+layer, which partially caught S2 when working on raw features, misses S2
+entirely once PACT calibration has been applied first. S2's singleton
+accuracy under this configuration (0.618) matches PACT's original
+calibrated accuracy for that subject exactly, since the model is now never
+abstaining and always committing to a (frequently wrong) answer for S2.
+
+Meanwhile S10 is still partially caught (81.4% abstain rate) — reduced from
+100% in Configuration 1, but still substantial.
+
+### Interpretation
+
+The most likely explanation: PACT's per-subject normalization is, by
+design, effective precisely because it removes between-person baseline
+differences — that is its entire purpose. But that same normalization may
+also remove the distributional signal a conformal/uncertainty layer needs
+to recognize that a subject's data is atypical relative to the population.
+By centering S2's features around S2's own baseline, PACT makes S2's
+calibrated data look statistically unremarkable next to everyone else's
+calibrated data, even though the underlying physiological response is
+genuinely unusual (see the S2 case study in the main paper).
+
+This is a genuine, non-obvious tension between two individually reasonable
+design goals — personalization (PACT) and outlier-awareness (conformal
+prediction) — not a bug in either component. It suggests naively stacking
+personalization on top of uncertainty quantification can undermine the
+latter, and that combining them well is a real open problem rather than a
+solved one. Practical implications and possible directions:
+
+- **Conformal prediction on raw features may be preferable** to stacking
+  it after PACT, specifically when the goal is catching atypical
+  individuals rather than maximizing average accuracy.
+- **A joint calibration procedure** — one that computes the conformal
+  threshold using un-normalized, or partially normalized, distributional
+  information — might recover S2-detection while retaining PACT's accuracy
+  gains, but this was not implemented or tested here.
+- **Reporting both configurations**, rather than only the better-looking
+  one, is itself the point: a system that quietly loses its ability to
+  flag hard cases when combined with an accuracy-improving technique is a
+  realistic failure mode worth knowing about before deployment, not a
+  result to average away.
 
 ## Usage
 
