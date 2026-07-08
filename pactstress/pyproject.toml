@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pactstress"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personalized Adaptive Calibration for sTress detection (PACT) from wearable physiological signals."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,7 +32,7 @@ signals = ["neurokit2>=0.2.0"]
 dev = ["pytest>=7.0"]
 
 [project.urls]
-Repository = "https://github.com/yourusername/pactstress"
+Repository = "https://github.com/sushan5140/pactstress"
 
 [tool.setuptools.packages.find]
 where = ["src"]

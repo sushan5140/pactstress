@@ -10,6 +10,8 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score
 from sklearn.model_selection import LeaveOneGroupOut
 
+from .conformal import compute_qhat, predict_sets, summarize_predictions
+
 
 def evaluate_loso(
     df,
@@ -84,4 +86,117 @@ def evaluate_loso(
         "std_accuracy": per_subject["accuracy"].std(),
         "mean_f1": per_subject["f1"].mean(),
         "std_f1": per_subject["f1"].std(),
+    }
+
+
+def evaluate_loso_conformal(
+    df,
+    feature_cols,
+    model,
+    alpha=0.1,
+    label_col="label",
+    subject_col="subject",
+    n_calib_subjects=2,
+    random_state=42,
+):
+    """
+    Evaluate a classifier with LOSO cross-validation, wrapped in split
+    conformal prediction so each test prediction is a set ({0}, {1}, or
+    {0, 1} for abstain) with a distribution-free coverage guarantee, rather
+    than a forced single-label prediction.
+
+    In each fold, the training subjects are further split subject-wise into
+    a "proper training" group (used to fit the model) and a "calibration"
+    group (used only to compute the conformal threshold). This keeps
+    calibration data separate from both model fitting and the held-out test
+    subject, avoiding the kind of leakage PACTCalibrator is designed to
+    prevent in the feature-normalization step.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Must contain `feature_cols`, `label_col`, and `subject_col`.
+    feature_cols : list of str
+        Feature columns to use as model input.
+    model : estimator
+        An unfitted scikit-learn-compatible classifier exposing
+        `predict_proba`. A fresh clone is trained in each fold.
+    alpha : float, default=0.1
+        Target miscoverage rate (0.1 -> 90% target coverage).
+    label_col, subject_col : str
+        Column names, as in `evaluate_loso`.
+    n_calib_subjects : int, default=2
+        Number of training subjects (per fold) held out purely for
+        conformal calibration. Must leave at least one subject for proper
+        training.
+    random_state : int, default=42
+        Seed controlling which training subjects are assigned to
+        calibration in each fold (for reproducibility).
+
+    Returns
+    -------
+    dict
+        {
+            "per_subject": DataFrame with columns
+                ["subject", "coverage", "singleton_rate", "abstain_rate",
+                 "singleton_accuracy"],
+            "mean_coverage": float,
+            "mean_abstain_rate": float,
+            "mean_singleton_accuracy": float,
+        }
+
+    Raises
+    ------
+    ValueError
+        If a fold has too few training subjects to leave at least one for
+        proper training after reserving `n_calib_subjects` for calibration.
+    """
+    rng = np.random.default_rng(random_state)
+    X = df[feature_cols]
+    y = df[label_col]
+    groups = df[subject_col]
+
+    logo = LeaveOneGroupOut()
+    records = []
+
+    for train_idx, test_idx in logo.split(X, y, groups):
+        train_subjects = groups.iloc[train_idx].unique()
+        test_subject = groups.iloc[test_idx].values[0]
+
+        if len(train_subjects) <= n_calib_subjects:
+            raise ValueError(
+                f"Fold for test subject '{test_subject}' has only "
+                f"{len(train_subjects)} training subjects, not enough to "
+                f"reserve {n_calib_subjects} for calibration and still "
+                f"have at least one for proper training."
+            )
+
+        shuffled = rng.permutation(train_subjects)
+        calib_subjects = set(shuffled[:n_calib_subjects])
+        proper_train_subjects = set(shuffled[n_calib_subjects:])
+
+        proper_train_mask = groups.isin(proper_train_subjects)
+        calib_mask = groups.isin(calib_subjects)
+
+        fold_model = deepcopy(model)
+        fold_model.fit(X[proper_train_mask], y[proper_train_mask])
+
+        calib_probs = fold_model.predict_proba(X[calib_mask])
+        qhat = compute_qhat(calib_probs, y[calib_mask].values, alpha=alpha)
+
+        test_probs = fold_model.predict_proba(X.iloc[test_idx])
+        pred_sets = predict_sets(test_probs, qhat)
+        summary = summarize_predictions(pred_sets, y.iloc[test_idx].values)
+        summary["subject"] = test_subject
+        records.append(summary)
+
+    per_subject = pd.DataFrame(records)[
+        ["subject", "coverage", "singleton_rate", "abstain_rate", "singleton_accuracy"]
+    ]
+
+    return {
+        "per_subject": per_subject,
+        "mean_coverage": per_subject["coverage"].mean(),
+        "mean_abstain_rate": per_subject["abstain_rate"].mean(),
+        "mean_singleton_accuracy": per_subject["singleton_accuracy"].mean(),
     }

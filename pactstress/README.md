@@ -132,6 +132,37 @@ pip install pactstress[dev]
 pytest tests/
 ```
 
+## Selective prediction (v0.2): knowing when the model doesn't know
+
+PACT's calibration doesn't fully solve every subject — the original case
+study (subject S2) found a physiologically atypical individual who remained
+misclassified even after calibration. Rather than forcing a wrong answer
+with false confidence, v0.2 adds a conformal prediction layer that lets the
+model abstain on cases it can't confidently classify, backed by a real
+statistical coverage guarantee rather than an ad hoc heuristic:
+
+```python
+from pactstress import evaluate_loso_conformal
+
+result = evaluate_loso_conformal(
+    df, feature_cols=feature_cols,
+    model=RandomForestClassifier(n_estimators=100, random_state=42),
+    alpha=0.1,
+)
+print(result["mean_coverage"], result["mean_abstain_rate"])
+```
+
+See [`docs/conformal_extension.md`](docs/conformal_extension.md) for the
+full method, motivation, and expected behavior on WESAD.
+
+## Citation
+
+If you use this package, please cite the accompanying study:
+
+> PACT: Personalized Adaptive Calibration for Stress Detection from
+> Multimodal Wearable Sensor Data. 2026.
+> Repository: https://github.com/sushan5140/pactstress
+
 ## License
 
 MIT
