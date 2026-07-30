@@ -1,21 +1,9 @@
 # pactstress
 
-**PACT: Personalized Adaptive Calibration for sTress detection**
-
-A small, focused toolkit for subject-independent wearable stress detection.
-Built around one core idea: physiological stress models trained on
-population-level data generalize poorly to individuals whose resting
-physiology differs from the group average. `pactstress` addresses this by
-calibrating each subject's features against their own resting-state
-statistics, computed from a small, fixed set of that subject's baseline
-windows — not the full session, and never using any window to normalize
-itself.
-
-This package was built alongside a study on the [WESAD dataset](https://doi.org/10.1145/3242969.3242985)
-(Schmidt et al., 2018), where PACT improved mean subject-independent
-accuracy from 87.5% to 90.7% under Leave-One-Subject-Out cross-validation.
-
-## Installation
+**PACT: Personalized Adaptive Calibration for sTress detection.**
+A small toolkit that calibrates wearable physiological features against
+each subject's own resting baseline — because a population model has no
+way to know whose body it's looking at.
 
 ```bash
 pip install pactstress
@@ -24,17 +12,63 @@ pip install pactstress
 pip install pactstress[signals]
 ```
 
-## Why calibration matters
+---
+
+## The problem
 
 A resting heart rate of 100 bpm means something different for someone
 whose baseline is normally 100 than for someone whose baseline is normally
-65. A model trained on population averages has no way to know which kind
-of person it's looking at unless it's told. PACT gives it that
-information directly, using a short calibration period — similar to how
-a real wearable device might ask a user to sit calmly for a couple of
-minutes before making predictions.
+65. A model trained on population-level averages has no way to distinguish
+these two people unless it's told — and most wearable stress-detection
+pipelines never tell it.
 
-## Quick start
+`pactstress` calibrates each subject's features against their own
+resting-state statistics, computed from a small, fixed set of that
+subject's baseline windows — never the full session, and never a window
+normalized against itself. It's the same idea as a real wearable device
+asking you to sit calmly for a couple of minutes before it starts making
+predictions.
+
+We validated this on the [WESAD dataset](https://doi.org/10.1145/3242969.3242985)
+(Schmidt et al., 2018): under Leave-One-Subject-Out cross-validation,
+personal-baseline calibration raised mean subject-independent accuracy
+from **87.5% to 90.7%**.
+
+## The problem underneath the problem
+
+Calibration doesn't fix every subject. The original case study found
+subject S2: clean, artifact-free signals, but a physiologically atypical
+stress response (stable heart rate, slow deep breathing) that the model
+got confidently, consistently wrong — F1 = 0.000 for that subject, even
+after calibration. A model that's *wrong and confident* is a worse failure
+mode than one that's *uncertain and says so*.
+
+v0.2 adds a split-conformal selective-prediction layer on top: instead of
+forcing "stress" or "not-stress," the model can output `{stress,
+not-stress}` (abstain) when it can't confidently tell, backed by a
+distribution-free coverage guarantee rather than an ad hoc confidence
+threshold. We validated it on WESAD in two configurations, and the two
+don't simply agree:
+
+| Metric | Conformal on raw features | Conformal on **PACT-calibrated** features |
+|---|---|---|
+| Mean coverage (target 0.90) | 0.899 | 0.865 |
+| Mean abstain rate | 0.153 | 0.136 |
+| Mean singleton accuracy | 0.930 | 0.926 |
+| **S10** (worst population-level subject, 42.9% acc.) | abstains **100%** of windows | abstains 81.4% of windows |
+| **S2** (the atypical case above) | abstains 11.9%, singleton acc. 0.673 | abstains **0%**, singleton acc. 0.618 |
+
+On raw features, conformal prediction does exactly what it's supposed to:
+S10 abstains on every window rather than being confidently wrong, and S2
+is partially caught. But stacked on top of PACT-calibrated features,
+coverage drops meaningfully below target and **S2's abstain rate falls to
+zero** — the personalization that helps accuracy also removes the
+distributional signal the conformal layer needs to flag S2 as atypical.
+Reporting both configurations, rather than only the better-looking one, is
+itself the point: see [`docs/conformal_extension.md`](docs/conformal_extension.md)
+for the full method and interpretation.
+
+## Quickstart
 
 ```python
 import pandas as pd
@@ -63,6 +97,24 @@ print(f"Mean F1: {results['mean_f1']:.3f}")
 print(results["per_subject"])
 ```
 
+Selective prediction (v0.2) wraps the same evaluation in a conformal layer:
+
+```python
+from pactstress import evaluate_loso_conformal
+
+result = evaluate_loso_conformal(
+    df, feature_cols=feature_cols,
+    model=RandomForestClassifier(n_estimators=100, random_state=42),
+    alpha=0.1,
+)
+print(result["mean_coverage"], result["mean_abstain_rate"])
+```
+
+For a lower-level API — inspecting individual prediction sets rather than
+aggregate summaries — use `compute_qhat`, `predict_sets`, and
+`summarize_predictions` directly; see their docstrings in
+`src/pactstress/conformal.py`.
+
 ## Extracting features from raw signals
 
 If you're starting from raw ECG/EDA/respiration signals rather than
@@ -88,9 +140,11 @@ df = extract_windowed_features(
 
 This segments the signals into overlapping windows, assigns each window a
 label by majority vote, and extracts HRV, EDA, and respiration features
-per window using NeuroKit2.
+per window using NeuroKit2. See `examples/wesad_example.py` for a full
+end-to-end script (population-level baseline vs. PACT-calibrated,
+per-subject breakdown).
 
-## API overview
+## API
 
 | Function / Class | Purpose |
 |---|---|
@@ -99,22 +153,32 @@ per window using NeuroKit2.
 | `extract_windowed_features(...)` | Full raw-signal → feature-table pipeline (requires `neurokit2`) |
 | `PACTCalibrator(feature_cols, n_calib_windows, baseline_label)` | Personal baseline calibration |
 | `evaluate_loso(df, feature_cols, model, label_col, subject_col)` | Leave-One-Subject-Out cross-validation |
+| `evaluate_loso_conformal(df, feature_cols, model, alpha, n_calib_subjects, ...)` | LOSO wrapped in split conformal prediction |
+| `compute_qhat`, `predict_sets`, `summarize_predictions` | Lower-level conformal building blocks |
 
-## A note on methodological correctness
+## Things this package will tell you that others won't
 
-An earlier version of this calibration approach (during development)
-computed each subject's reference statistics from *all* of their baseline
-windows, including ones used for evaluation. This produced misleadingly
-high accuracy (95–97%) because evaluation windows contributed to their own
-normalization reference. `PACTCalibrator` avoids this by using a small,
-fixed subset of a subject's earliest baseline windows as the calibration
-reference, and removing those specific windows from the returned dataset
-entirely — so no window is ever normalized using its own value, and no
-evaluation data leaks into calibration statistics. If you're extending
-this package, preserve that separation; it's the difference between a
-real result and an inflated one.
+**An earlier version of this calibration leaked evaluation data into
+itself, and it looked *better* for it.** During development, subject
+reference statistics were computed from *all* of a subject's baseline
+windows, including ones later used for evaluation. That produced
+misleadingly high accuracy (95–97%) because evaluation windows contributed
+to their own normalization reference. `PACTCalibrator` avoids this with a
+small, fixed subset of a subject's earliest baseline windows as the
+calibration reference, removing those specific windows from the returned
+dataset entirely — no window is ever normalized using its own value, and
+no evaluation data leaks into calibration statistics. The conformal layer
+(`evaluate_loso_conformal`) follows the same discipline: calibration
+subjects are split out subject-wise, distinct from both the proper
+training group and the held-out test subject.
 
-## Known limitations
+**Personalization and uncertainty-detection can work against each other.**
+See "The problem underneath the problem" above — PACT calibration improves
+mean accuracy but can simultaneously erase the exact signal a conformal
+layer needs to flag an atypical subject. This package reports that tension
+rather than only the configuration that looks best.
+
+## Honest limitations
 
 - Calibration requires a minimum number of baseline windows per subject
   (`n_calib_windows`, default 4). Subjects with fewer baseline windows
@@ -124,6 +188,20 @@ real result and an inflated one.
 - Developed and validated on WESAD (15 subjects, chest-worn sensors,
   laboratory-induced stress). Performance on wrist-worn consumer sensors
   or real-world (non-laboratory) stress has not been evaluated.
+- Conformal prediction guarantees *marginal* coverage (averaged across all
+  test examples), not per-subject coverage — a subject with unusual
+  features can still be individually over- or under-covered even when the
+  overall guarantee holds. This is a known property of the method, not a
+  bug in this implementation.
+- `n_calib_subjects` in `evaluate_loso_conformal` is a small, fixed number
+  of subjects per fold; with only 15 subjects total in WESAD, the
+  calibration set itself is small, which makes empirical coverage noisier
+  than it would be with a larger dataset. Treat per-fold coverage numbers
+  as approximate, and look at the mean across folds rather than any single
+  fold in isolation.
+- The conformal layer ensures the model reports honestly when it doesn't
+  know; it does not fix the underlying reason a subject like S2 is hard to
+  classify in the first place.
 
 ## Running tests
 
@@ -131,29 +209,6 @@ real result and an inflated one.
 pip install pactstress[dev]
 pytest tests/
 ```
-
-## Selective prediction (v0.2): knowing when the model doesn't know
-
-PACT's calibration doesn't fully solve every subject — the original case
-study (subject S2) found a physiologically atypical individual who remained
-misclassified even after calibration. Rather than forcing a wrong answer
-with false confidence, v0.2 adds a conformal prediction layer that lets the
-model abstain on cases it can't confidently classify, backed by a real
-statistical coverage guarantee rather than an ad hoc heuristic:
-
-```python
-from pactstress import evaluate_loso_conformal
-
-result = evaluate_loso_conformal(
-    df, feature_cols=feature_cols,
-    model=RandomForestClassifier(n_estimators=100, random_state=42),
-    alpha=0.1,
-)
-print(result["mean_coverage"], result["mean_abstain_rate"])
-```
-
-See [`docs/conformal_extension.md`](docs/conformal_extension.md) for the
-full method, motivation, and expected behavior on WESAD.
 
 ## Citation
 
